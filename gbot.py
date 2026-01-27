@@ -1,62 +1,95 @@
 import firebase_admin
 from firebase_admin import credentials, firestore
+import google.generativeai as genai
 import mss
 import mss.tools
 import pyautogui
 import time
 import os
+import json
+from dotenv import load_dotenv
+from PIL import Image
 
 # --- CONFIGURATION ---
+load_dotenv()
 CRED_FILE = 'service-account.json'
+API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# --- 1. SETUP FIREBASE ---
+# --- SETUP AI ---
+if not API_KEY:
+    print("❌ ERROR: No GOOGLE_API_KEY found in .env")
+    exit()
+
+genai.configure(api_key=API_KEY)
+# Using the stable model that worked for you
+model = genai.GenerativeModel('gemini-2.5-flash')
+
+# --- SETUP FIREBASE ---
 cred = credentials.Certificate(CRED_FILE)
 app = firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# --- 2. THE BODY (GHOST DRIVER) ---
 def get_ghost_monitor_id(sct):
     """Auto-detects the right-most monitor (The Ghost)"""
     ghost_id = -1
     max_left = -99999
     
     for i, monitor in enumerate(sct.monitors):
-        if i == 0: continue # Skip 'All Combined'
+        if i == 0: continue
         if monitor["left"] > max_left:
             max_left = monitor["left"]
             ghost_id = i
     return ghost_id
 
-def execute_ghost_action(action_name):
-    """
-    This is where the robot actually moves.
-    For now, we just perform a 'Check' action (Screenshot + Center Mouse).
-    """
-    print(f"👻 GHOST ACTING: Performing '{action_name}'...")
+def analyze_and_click(target_description):
+    print(f"🧠 THINKING: Looking for '{target_description}'...")
     
     with mss.mss() as sct:
-        # A. Find the Ghost
+        # 1. Capture Ghost Screen
         ghost_id = get_ghost_monitor_id(sct)
-        if ghost_id == -1:
-            return "❌ Error: Ghost Monitor not found!"
+        if ghost_id == -1: return "❌ Error: Ghost Monitor not found!"
 
         monitor = sct.monitors[ghost_id]
+        sct_img = sct.grab(monitor)
+        img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
         
-        # B. Move Mouse to Center of Ghost Screen
-        center_x = monitor["left"] + (monitor["width"] // 2)
-        center_y = monitor["top"] + (monitor["height"] // 2)
+        # 2. Ask Gemini for Coordinates
+        prompt = f"""
+        Look at this screenshot. I need to click on: "{target_description}".
+        Return ONLY a JSON object with the coordinates.
+        Format: {{ "x": <int>, "y": <int> }}
+        If not found, return {{ "error": "not found" }}
+        """
         
-        print(f"   🖱️  Moving to Ghost Center ({center_x}, {center_y})")
-        pyautogui.moveTo(center_x, center_y, duration=0.5)
-        
-        # C. Take Proof of Life Screenshot
-        output_file = "ghost_action_proof.png"
-        screenshot = sct.grab(monitor)
-        mss.tools.to_png(screenshot.rgb, screenshot.size, output=output_file)
-        
-        return f"✅ Action '{action_name}' executed on Monitor {ghost_id}. Proof saved to {output_file}."
+        try:
+            response = model.generate_content([prompt, img])
+            clean_text = response.text.replace("```json", "").replace("```", "").strip()
+            data = json.loads(clean_text)
+        except Exception as e:
+            return f"❌ AI Error: {e}"
 
-# --- 3. THE NERVOUS SYSTEM (LISTENER) ---
+        if "error" in data:
+            return f"❌ Could not find '{target_description}' on screen."
+
+        # 3. COORDINATE MATH (The most important part)
+        # Gemini gives coordinates relative to the screenshot (0,0 is top-left of Ghost)
+        # We need Global Coordinates (0,0 is top-left of Main Screen)
+        
+        local_x = data['x']
+        local_y = data['y']
+        
+        global_x = monitor["left"] + local_x
+        global_y = monitor["top"] + local_y
+        
+        print(f"   🎯 TARGET ACQUIRED: Local({local_x},{local_y}) -> Global({global_x},{global_y})")
+        
+        # 4. EXECUTE
+        pyautogui.moveTo(global_x, global_y, duration=0.7)
+        pyautogui.click()
+        
+        return f"✅ Clicked '{target_description}' at ({global_x}, {global_y})"
+
+# --- THE LISTENER LOOP ---
 def on_command(doc_snapshot, changes, read_time):
     for change in changes:
         if change.type.name == 'ADDED':
@@ -64,22 +97,23 @@ def on_command(doc_snapshot, changes, read_time):
             doc_id = change.document.id
             
             if data.get('status') == 'pending':
-                print(f"\n📨 TRIGGER: {data.get('action')}")
+                action = data.get('action')
+                print(f"\n📨 COMMAND: {action}")
                 
-                # EXECUTE THE BODY
-                result = execute_ghost_action(data.get('action'))
+                # Run the Vision Agent
+                result = analyze_and_click(action)
+                print(f"   {result}")
                 
-                # REPORT BACK TO CLOUD
+                # Report back to Cloud
                 db.collection('commands').document(doc_id).update({
                     'status': 'completed',
                     'response': result
                 })
-                print("   📡 Cloud updated.")
 
 def main():
-    print("🤖 G-BOT ONLINE. Watching for Firestore commands...")
+    print("🤖 G-BOT V1 ONLINE. Connected to Nervous System & Vision Center.")
+    print("   Waiting for orders...")
     
-    # Listen to 'commands' collection
     query = db.collection('commands').where('status', '==', 'pending')
     query.on_snapshot(on_command)
     
