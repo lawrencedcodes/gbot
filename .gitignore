@@ -1,3 +1,7 @@
 service-account.json
 .env
 node_modules
+venv/
+__pycache__/
+*.log
+brain_debug.png
