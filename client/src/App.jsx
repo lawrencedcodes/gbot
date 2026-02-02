@@ -1,114 +1,184 @@
-import { useState, useEffect } from 'react';
-import { db, auth } from './firebase';
-import { signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut } from "firebase/auth";
-import { collection, addDoc, query, orderBy, limit, onSnapshot } from 'firebase/firestore';
-import './App.css';
-
-const provider = new GoogleAuthProvider();
+import { useState, useEffect, useRef } from "react";
+import { auth, db } from "./firebase";
+import {
+  signInWithPopup,
+  GoogleAuthProvider,
+  signOut,
+  onAuthStateChanged,
+} from "firebase/auth";
+import {
+  collection,
+  addDoc,
+  query,
+  orderBy,
+  limit,
+  onSnapshot,
+  serverTimestamp,
+} from "firebase/firestore";
+import "./App.css";
 
 function App() {
   const [user, setUser] = useState(null);
   const [input, setInput] = useState("");
-  const [status, setStatus] = useState("OFFLINE");
-  const [lastResponse, setLastResponse] = useState("");
+  const [messages, setMessages] = useState([]);
+  const [loading, setLoading] = useState(false);
 
-  // 1. Listen for Authentication (Are you logged in?)
+  // Ref to auto-scroll to bottom
+  const endOfMessagesRef = useRef(null);
+
   useEffect(() => {
-    const unsubAuth = onAuthStateChanged(auth, (currentUser) => {
+    const unsubscribeAuth = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
     });
-    return () => unsubAuth();
+    return () => unsubscribeAuth();
   }, []);
 
-  // 2. Listen for Database Updates (Only if logged in)
+  // 🔥 Listen for Chat History
   useEffect(() => {
     if (!user) return;
 
+    // Get last 50 messages ordered by time
     const q = query(
       collection(db, "commands"),
-      orderBy("timestamp", "desc"),
-      limit(1)
+      orderBy("createdAt", "asc"),
+      limit(50),
     );
 
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      if (!snapshot.empty) {
-        const doc = snapshot.docs[0].data();
-        setStatus(doc.status.toUpperCase());
-        if (doc.response) setLastResponse(doc.response);
-      }
-    }, (error) => {
-      console.error("Access Denied:", error);
-      setStatus("ACCESS DENIED");
+    const unsubscribeDocs = onSnapshot(q, (snapshot) => {
+      const msgs = snapshot.docs.map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+      }));
+      setMessages(msgs);
     });
 
-    return () => unsubscribe();
+    return () => unsubscribeDocs();
   }, [user]);
 
-  const handleLogin = () => {
-    signInWithPopup(auth, provider).catch(console.error);
-  };
+  // Auto-scroll when messages change
+  useEffect(() => {
+    endOfMessagesRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
-  const sendCommand = async () => {
-    if (!input || !user) return;
-    
+  const handleLogin = async () => {
+    const provider = new GoogleAuthProvider();
     try {
-      await addDoc(collection(db, "commands"), {
-        action: input,
-        status: "pending",
-        timestamp: new Date(),
-        user: user.email 
-      });
-      setInput("");
-      setStatus("SENT");
-    } catch (e) {
-      console.error("Error sending command: ", e);
-      setStatus("ERROR");
+      await signInWithPopup(auth, provider);
+    } catch (error) {
+      console.error("Login failed", error);
     }
   };
 
-  // --- RENDER: LOGIN SCREEN ---
+  const handleLogout = async () => {
+    await signOut(auth);
+    setMessages([]);
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+
+    setLoading(true);
+    try {
+      await addDoc(collection(db, "commands"), {
+        text: input,
+        status: "pending",
+        createdAt: serverTimestamp(), // Important for sorting
+        user: user.email,
+      });
+      setInput("");
+    } catch (error) {
+      console.error("Error sending command:", error);
+    }
+    setLoading(false);
+  };
+
   if (!user) {
     return (
-      <div className="container login-screen">
-        <h1>G-BOT REMOTE 👻</h1>
-        <p>Biometric Authentication Required</p>
-        <button className="auth-btn" onClick={handleLogin}>ACCESS SYSTEM</button>
+      <div className="login-container">
+        <h1>👻 G-BOT V2</h1>
+        <p>Restricted Access. Identity Verification Required.</p>
+        <button onClick={handleLogin} className="login-btn">
+          Authenticate with Google
+        </button>
       </div>
     );
   }
 
-  // --- RENDER: COMMAND DECK ---
   return (
-    <div className="container">
-      <div className="header">
-        <div className="user-badge">👤 {user.displayName.split(" ")[0]}</div>
-        <button className="logout-btn" onClick={() => signOut(auth)}>DISCONNECT</button>
-      </div>
-      
-      <h1>G-BOT V1</h1>
-      
-      <div className="status-panel">
-        <div className="status-row">
-           <span className={`led ${status === 'COMPLETED' ? 'green' : status === 'PENDING' ? 'yellow' : 'red'}`}></span>
-           <span className="status-text">{status}</span>
-        </div>
-        <div className="console-output">
-          &gt; {lastResponse || "System ready..."}
-        </div>
+    <>
+      <header>
+        <h1>
+          <div className="status-dot"></div>
+          G-BOT ONLINE
+        </h1>
+        <button onClick={handleLogout} className="logout-btn">
+          Disconnect
+        </button>
+      </header>
+
+      <div className="chat-window">
+        {messages.map((msg) => (
+          <div key={msg.id} className="message-group">
+            {/* 1. The User's Command */}
+            <div className={`message-row user`}>
+              <div className="bubble user">{msg.text}</div>
+            </div>
+
+            {/* 2. The Bot's Response (If it exists) */}
+            {msg.status !== "pending" && (
+              <div className={`message-row bot`}>
+                <div
+                  className={`bubble ${msg.status === "error" ? "error" : "bot"}`}
+                >
+                  {msg.status === "completed" ? (
+                    <>
+                      <strong>✅ Executed:</strong>
+                      <br />
+                      {msg.response}
+                    </>
+                  ) : msg.status === "error" ? (
+                    <>
+                      <strong>❌ Error:</strong>
+                      <br />
+                      {msg.error}
+                    </>
+                  ) : null}
+                  <span className="meta">
+                    {msg.processedAt?.toDate
+                      ? msg.processedAt.toDate().toLocaleTimeString()
+                      : "Just now"}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* 3. Pending Indicator */}
+            {msg.status === "pending" && (
+              <div className="message-row bot">
+                <div className="bubble bot" style={{ opacity: 0.7 }}>
+                  Processing... ⏳
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+        <div ref={endOfMessagesRef} />
       </div>
 
-      <div className="input-deck">
-        <input 
-          type="text" 
+      <form className="input-area" onSubmit={handleSubmit}>
+        <input
+          type="text"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Enter directive..."
-          onKeyDown={(e) => e.key === 'Enter' && sendCommand()}
-          autoFocus
+          placeholder="Enter command..."
+          disabled={loading}
         />
-        <button className="send-btn" onClick={sendCommand}>EXECUTE</button>
-      </div>
-    </div>
+        <button type="submit" className="send-btn" disabled={loading}>
+          {loading ? "..." : "SEND"}
+        </button>
+      </form>
+    </>
   );
 }
 
